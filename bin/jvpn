@@ -5,7 +5,7 @@
 
 """
 
-__author__ = 'Ebben Aries (earies@juniper.net)'
+__author__ = 'e@dscp.org (Ebben Aries)'
 __version__ = '1.0.0'
 
 import ConfigParser
@@ -35,7 +35,7 @@ parser = OptionParser(usage='%prog [options]', version='%prog ' + '%s - %s'
 parser.add_option('--cache', action='store_true', dest='cache',
                   help='Connect using cached cookie (Incompatible with --password)')
 parser.add_option('-c', '--config', dest='config_file',
-                  help='Alternate configuration file [Default: ~/.junipervpn/conf/jvpn.conf')
+                  help='Alternate configuration file [Default: ~/.jvpn/conf/jvpn.conf')
 parser.add_option('--curses', action='store_true', dest='curses',
                   help='Enable curses interface for connect/status/statistics')
 parser.add_option('--gui', action='store_true', dest='gui',
@@ -79,7 +79,7 @@ def GetConfig(site, item):
   Returns:
     value: string or integer depending on configuration
   """
-  conf_file = os.path.join(os.getenv('HOME'), '.junipervpn','conf', 'jvpn.conf')
+  conf_file = os.path.join(os.getenv('HOME'), '.jvpn','conf', 'jvpn.conf')
   if not os.path.exists(conf_file):
     Output('%s does not exist' % (conf_file), type='stderr', exit='yes')
   config = ConfigParser.ConfigParser()
@@ -88,7 +88,7 @@ def GetConfig(site, item):
   return value
 
 def WriteConfig(site, **items):
-  conf_file = os.path.join(os.getenv('HOME'), '.junipervpn', 'conf', 'jvpn.conf')
+  conf_file = os.path.join(os.getenv('HOME'), '.jvpn', 'conf', 'jvpn.conf')
   if not os.path.exists(conf_file):
     Output('%s does not exist' % (conf_file), type='stderr', exit='yes')
   config = ConfigParser.ConfigParser()
@@ -105,7 +105,7 @@ def StartLogging(site, host):
   try:
     log_filename = GetConfig(site, 'log_file')
   except ConfigParser.NoOptionError:
-    log_filename = os.path.join(os.getenv('HOME'), '.junipervpn', 'logs', host + '.log')
+    log_filename = os.path.join(os.getenv('HOME'), '.jvpn', 'logs', host + '.log')
   try:
     logging.basicConfig(format='>> %(name)-8s %(asctime)s %(levelname)8s %(lineno)-5s %(message)s',
                         filename=log_filename, level=logging.DEBUG)
@@ -131,7 +131,7 @@ def GetRealm(host):
 class Vpn(object):
   def __init__(self, user, host, realm, password,
                logger, tunnel_routes, site, display):
-    self.jvpn_dir = os.path.join(os.getenv('HOME'), '.junipervpn')
+    self.jvpn_dir = os.path.join(os.getenv('HOME'), '.jvpn')
     self.nc_dir = os.path.join(os.getenv('HOME'), '.juniper_networks', 'network_connect')
     self.ncui = os.path.join(self.nc_dir, 'ncui')
     self.user = user
