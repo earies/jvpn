@@ -1,0 +1,468 @@
+#!/usr/bin/env python
+#
+# $Id$
+"""JVPN
+
+"""
+
+__author__ = 'Ebben Aries (earies@juniper.net)'
+__version__ = '1.0.0'
+
+import ConfigParser
+import cookielib
+import getpass
+import logging
+import os
+import re
+import signal
+import ssl
+import subprocess
+import sys
+import time
+import urllib
+import urllib2
+
+from optparse import OptionParser
+from optparse import SUPPRESS_HELP
+from string import split
+
+from jvpn import display
+from jvpn import netstats
+from jvpn import utils
+
+parser = OptionParser(usage='%prog [options]', version='%prog ' + '%s - %s'
+                          % (__version__, __author__), conflict_handler='resolve')
+parser.add_option('--cache', action='store_true', dest='cache',
+                  help='Connect using cached cookie (Incompatible with --password)')
+parser.add_option('-c', '--config', dest='config_file',
+                  help='Alternate configuration file [Default: ~/.junipervpn/conf/jvpn.conf')
+parser.add_option('--curses', action='store_true', dest='curses',
+                  help='Enable curses interface for connect/status/statistics')
+parser.add_option('--gui', action='store_true', dest='gui',
+                  help=SUPPRESS_HELP)
+parser.add_option('-p', '--password', dest='password',
+                  help='User Password (Optional)')
+parser.add_option('-r', '--realm', action='store_true', dest='realm',
+                  help='Retreive VPN realm value from host')
+parser.add_option('--recompile', action='store_true', dest='recompile',
+                  help='Recompile ncui binary after client upgrade')
+parser.add_option('-s', '--site', dest='site',
+                  help='Site ID (Mandatory)')
+parser.add_option('--stop', action='store_true', dest='stop',
+                  help='Kill ncui process if it is running')
+parser.add_option('--split', action='store_true', dest='split',
+                  help='Enable split tunneling')
+parser.add_option('-u', '--user', dest='username',
+                  help='Alternate username')
+(options, args) = parser.parse_args()
+
+
+def Output(message, type='stdout', exit='no'):
+  """Print style messaging
+  Wrapper function
+  """
+  message = message + '\n'
+  if type == 'stdout':
+    sys.stdout.write('INFO: %s' % (message))
+  if type == 'stderr':
+    sys.stderr.write('ERROR: %s' % (message))
+  if exit == 'yes':
+    sys.exit()
+
+def GetConfig(site, item):
+  """Get corresponding value for item specified
+
+  Args:
+    site: string, site id passed into script
+    item: string, configuration file variable
+
+  Returns:
+    value: string or integer depending on configuration
+  """
+  conf_file = os.path.join(os.getenv('HOME'), '.junipervpn','conf', 'jvpn.conf')
+  if not os.path.exists(conf_file):
+    Output('%s does not exist' % (conf_file), type='stderr', exit='yes')
+  config = ConfigParser.ConfigParser()
+  config.read(conf_file)
+  value = config.get(site, item)
+  return value
+
+def WriteConfig(site, **items):
+  conf_file = os.path.join(os.getenv('HOME'), '.junipervpn', 'conf', 'jvpn.conf')
+  if not os.path.exists(conf_file):
+    Output('%s does not exist' % (conf_file), type='stderr', exit='yes')
+  config = ConfigParser.ConfigParser()
+  conf_handler = open(conf_file, 'a')
+  config.add_section(site)
+  for item in items:
+    config.set(site, item, items[item])
+  config.write(conf_handler)
+  conf_handler.close()
+
+
+def StartLogging(site, host):
+  logid = 'jvpn'
+  try:
+    log_filename = GetConfig(site, 'log_file')
+  except ConfigParser.NoOptionError:
+    log_filename = os.path.join(os.getenv('HOME'), '.junipervpn', 'logs', host + '.log')
+  try:
+    logging.basicConfig(format='>> %(name)-8s %(asctime)s %(levelname)8s %(lineno)-5s %(message)s',
+                        filename=log_filename, level=logging.DEBUG)
+  except IOError, e:
+    Output('Unable to create logfile (%s)' % (str(e)), type='stderr', exit='yes')
+  console = logging.StreamHandler()
+  console.setLevel(logging.INFO)
+  formatter = logging.Formatter('>> %(name)-8s: %(levelname)-8s %(message)s')
+  console.setFormatter(formatter)
+  logging.getLogger('').addHandler(console)
+  logger = logging.getLogger(logid)
+  return logger
+
+def GetRealm(host):
+  try:
+    response = urllib2.urlopen('https://%s/dana-na/auth/url_default/welcome.cgi' % (host))
+    html = response.read()
+    realm = re.findall('name=\"realm\" value=\"(\S+)\"', html)[0] 
+  except urllib2.URLError:
+    realm = False
+  return realm
+
+class Vpn(object):
+  def __init__(self, user, host, realm, password,
+               logger, tunnel_routes, site, display):
+    self.jvpn_dir = os.path.join(os.getenv('HOME'), '.junipervpn')
+    self.nc_dir = os.path.join(os.getenv('HOME'), '.juniper_networks', 'network_connect')
+    self.ncui = os.path.join(self.nc_dir, 'ncui')
+    self.user = user
+    self.host = host
+    self.realm = realm
+    self.dsid_temp = os.path.join(self.jvpn_dir, 'cache', self.host + '.dsid')
+    self.cert_file = os.path.join(self.jvpn_dir, 'certs', self.host + '.crt')
+    self.password = password
+    self.tunnel_routes = tunnel_routes
+    self.site = site
+    self.display = display
+    self.logger = logger
+    self.logger.info('Initiating VPN to: %s' % self.host)
+    self.StartVpn()
+
+  def Login(self):
+    if self.password is None:
+      self.password = getpass.getpass()
+    self.result = None
+    self.cj = cookielib.CookieJar()
+    self.opener = urllib2.build_opener(urllib2.HTTPCookieProcessor(self.cj))
+    self.opener.addheaders = [('User-agent', 'Mozilla/5.0')]
+    self.login_data = urllib.urlencode({'username' : self.user,
+                                        'password' : self.password,
+                                        'realm' : self.realm})
+    self.req1 = self.opener.open('https://%s/dana-na/auth/url_default/login.cgi' % (self.host), self.login_data)
+    time.sleep(2)
+    self.result = self.req1.read()
+    if re.search('Loading (Content|Applet)', self.result):
+      self.logger.info('Authenticated')
+      self.GetDsid()
+    elif re.search('Invalid username or password', self.result):
+      self.logger.info('Authentication Failed')
+      self.password = None
+      self.Login()
+    elif re.search('Close Selected Sessions', self.result):
+      self.logger.info('Maximum logins reached')
+      if self.LogoutMaxSessions() is True:
+        self.GetDsid()
+      else:
+        self.logger.info('Unable to logout previous session - exiting')
+        sys.exit()
+    elif re.search('Token Resync Required', self.result):
+      self.logger.info('Token Resync Required')
+      token_state = self.ResyncToken()
+      if token_state == 0:
+        if self.LogoutMaxSessions() is True:
+          self.GetDsid()
+        else:
+          self.logger.info('Unable to logout previous session - exiting')
+          sys.exit()
+      elif token_state == 1:
+        self.logger.info('Authenticated')
+        self.GetDsid()
+      else:
+        self.logger.info('Unknown Error')
+        sys.exit()
+    elif re.search('invalid sign-in attempts', self.result):
+      self.logger.info('Too many invalid sign-in attempts - Please wait before next attempt')
+      sys.exit()
+    else:
+      self.logger.info('Unknown Error')
+
+  def ResyncToken(self):
+    try:
+      key = re.findall('name=\"key\" value=\"state_(\S+)\"', self.result)[0]
+      state_key = 'state_' + key
+      self.logger.info('Token Resync state_key found: %s' % (state_key))
+    except IndexError, e:
+      self.logger.info('Could not find key value during Token Resync')
+    resync_password = getpass.getpass('Enter Next Token: ')
+    self.resync_data = urllib.urlencode({'key' : state_key,
+                                         'secidactionEnter' : 'Enter',
+                                         'password' : resync_password})
+    self.resync_url = self.opener.open('https://%s/dana-na/auth/url_default/login.cgi' % (self.host), self.resync_data)
+    self.logger.info('Resyncing Token')
+    time.sleep(2)
+    self.resync_result = self.resync_url.read()
+    if re.search('Close Selected Sessions', self.resync_result):
+      self.logger.info('Token resync complete')
+      return 0
+    elif re.search('Loading Applet', self.resync_result):
+      self.logger.info('Token resync complete')
+      return 1
+    else:
+      self.logger.info('Token resync failed')
+      return 2
+
+  def GetOldSessionInfo(self):
+    self.oldsessioninfo = {}
+    try:
+      self.ip = re.findall('<td>(\d+\.\d+\.\d+\.\d+)<\/td>', self.result)[0]
+      self.oldsessioninfo['ip'] = self.ip
+    except IndexError, e:
+      self.logger.info('Could not parse IP Address from old session')
+      self.oldsessioninfo['ip'] = None
+    try:
+      self.logintime = re.findall('<td>(\d+\/\d+\/\d+ \d+\:\d+\:\d+)<\/td>', self.result)[0]
+      self.oldsessioninfo['logintime'] = self.logintime
+    except IndexError, e:
+      self.logger.info('Could not parse Login Time from old session')
+      self.oldsessioninfo['logintime'] = None
+    try:
+      self.postfixsid = re.findall('name=\"postfixSID\" value=\"(\S+)\"\/\>', self.result)[0]
+      self.oldsessioninfo['postfixsid'] = self.postfixsid
+    except IndexError, e:
+      self.logger.info('Could not parse postfixSID')
+      self.oldsessioninfo['postfixsid'] = None
+    try:
+      self.formdatastr = re.findall('name=\"FormDataStr\" value=\"(\S+)\"\>', self.result)[0]
+      self.oldsessioninfo['formdatastr'] = self.formdatastr
+    except IndexError, e:
+      self.logger.info('Could not parse FormDataStr')
+      self.oldsessioninfo['formdatastr'] = None
+    return self.oldsessioninfo
+
+
+  def LogoutMaxSessions(self):
+    self.oldsession = self.GetOldSessionInfo()
+    self.format = '%-15s %-15s'
+    print '\n'
+    print self.format % ('IP Address', 'Login Time')
+    print '-' * 40
+    print self.format % (self.oldsession['ip'], self.oldsession['logintime'])
+    print '\n'
+    prompt = raw_input('Are you sure you want to logout of the above session? [yes/no]: ')
+    if prompt == 'yes':
+      self.logger.info('Attempting to logout session at IP (%s)' % (self.oldsession['ip']))
+      self.logout_data = urllib.urlencode({'postfixSID' : self.oldsession['postfixsid'],
+                                           'btnContinue' : 'Close Selected Sessions and Log in',
+                                           'FormDataStr' : self.oldsession['formdatastr']})
+      self.logout_url = self.opener.open('https://%s/dana-na/auth/url_default/login.cgi' % (self.host), self.logout_data)
+      time.sleep(2)
+      self.logout_result = self.logout_url.read()
+      if re.search('Loading Applet', self.logout_result):
+        self.logger.info('Logged out previous session')
+        return True
+      else:
+        self.logger.info('Unknown Error')
+        print self.logout_result
+        return False
+    else:
+      self.logger.info('Cancelling logout process')
+      return False
+
+  def GetCookies(self):
+    """ Work progress """
+    for index, cookie in enumerate(self.cj):
+      try:
+        self.dsid = re.findall('DSID=(\S+) ', str(cookie))[0]
+      except IndexError, e:
+        self.logger.info('Could not find DSID value')
+        self.dsid = None
+      try:
+        self.dsfirstaccess = re.findall('DSFirstAccess=(\d+) ', str(cookie))[0]
+      except IndexError, e:
+        self.logger.info('Could not find DSFirstAccess value')
+        self.dsfirstaccess = None
+
+  def GetDsid(self):
+    self.dsid = ''
+    self.isdsid = False
+    for index, cookie in enumerate(self.cj):
+      m = re.match('.*DSID=(\S+) .*', str(cookie))
+      if m:
+        self.dsid = m.group(1)
+        self.logger.debug('DSID found - value: %s' % (self.dsid))
+        self.isdsid = True
+    if self.isdsid == True:
+      fh = open(self.dsid_temp, 'w')
+      fh.write(self.dsid)
+      fh.close()
+      self.logger.info('DSID found - caching to: %s' % (self.dsid_temp))
+    else:
+      fh = open(self.dsid_temp, 'r')
+      self.dsid = fh.read().rstrip()
+      fh.close()
+      self.logger.info('No DSID found - using cached value: %s' % (self.dsid))
+    return self.dsid
+
+  def GetStats(self):
+    self.interface = 'tun0'
+    device = self.interface + ':'
+    for line in open('/proc/net/dev', 'r'):
+      data = filter(None, line.split(' '))
+      if data[0] == device:
+        return (data[1], data[2], data[9], data[10])
+
+  def CheckCert(self):
+    if not os.path.exists(self.cert_file):
+      self.logger.info('Certificate file not found [%s]' % (self.cert_file))
+      self.logger.info('Retreiving server certificate from: %s' % (self.host))
+      pem_cert = ssl.get_server_certificate((self.host, 443))
+      fh = open(self.cert_file, 'w')
+      fh.write(ssl.PEM_cert_to_DER_cert(pem_cert))
+      fh.close()
+
+  def StartVpn(self):
+    if self.password == '00000000':
+      fh = open(self.dsid_temp, 'r')
+      self.dsid = fh.read().rstrip()
+      fh.close()
+      self.logger.info('Logging in using cached DSID, this may desync your passcodes')
+    else:
+      self.login = self.Login()
+    self.CheckCert()
+    self.logger.info('All values retreived - Connecting to VPN gateway')
+    self.process = subprocess.Popen(
+      [self.ncui,
+      '-h', self.host,
+      '-f', self.cert_file,
+      '-c', 'DSID=' + self.dsid,
+      '-p', self.password],
+      stdout=subprocess.PIPE,
+      shell=False,
+      preexec_fn=os.setsid)
+    self.pid = int(self.process.pid)
+    self.logger.info('ncui started with pid: %d' % (self.pid))
+    for i in range(1,10):
+      if self.GetStats() is None:
+        time.sleep(2)
+        if i == 9:
+          self.logger.info('Failed to connect to vpn')
+          sys.exit()
+    self.logger.info('Connected to VPN successfully')
+    if self.tunnel_routes:
+      self.logger.info('Enabling split tunneling')
+      for route in split(self.tunnel_routes):
+        os.system('sudo ip route add %s dev tun0' % (route))
+      default_info = netstats.GetDefInterface()
+      os.system('sudo ip route add 0.0.0.0/1 via %s dev %s' % (default_info[0], default_info[1]))   
+      os.system('sudo ip route add 128.0.0.0/1 via %s dev %s' % (default_info[0], default_info[1]))   
+    if (self.display == 'curses'):
+      self.launch = display.Display(
+          host=self.host,
+          interface='tun0',
+          pid=self.pid,
+          logger=self.logger)
+      self.launch.Curses()
+    else:
+      self.logger.info('To terminate vpn - type \'pkill ncui\'')
+
+
+def main():
+
+  try:
+    pid = int(subprocess.Popen(['pidof', 'ncui'], stdout=subprocess.PIPE).communicate()[0])
+  except ValueError:
+    pid = None
+
+  if options.stop:
+    if pid is not None:
+      os.kill(pid, signal.SIGTERM)
+      Output('ncui process terminated successfully', type='stdout', exit='yes')
+    else:
+      Output('ncui is not currently running', type='stdout', exit='yes')
+
+  if pid is not None:
+    Output('ncui is already running', type='stderr', exit='yes')
+
+  if options.site:
+    try:
+      site = options.site
+      host = GetConfig(site, 'host')
+    except ConfigParser.NoSectionError:
+      Output('Site ID does not exist in config file', type='stderr', exit='yes')
+  else:
+    Output('Site ID is mandatory')
+    ok = raw_input("Would you like to add one now? (Y/N): ")
+    if ok in ('y', 'Y'):
+      site = raw_input("Enter Site ID (Shortname): ")
+      host = raw_input("Enter VPN Hostname: ") 
+      user = raw_input("Enter Username: ")
+      ok = raw_input('Would you like to retreive the remote realm value? (Y/N): ')
+      if ok in ('y', 'Y'):
+        realm = GetRealm(host=host)
+        if realm is not False:
+          Output('Realm found: %s' % (realm))
+        else:
+          Output('Invalid VPN Hostname, Realm not found', type='stderr', exit='yes')
+      else:
+        realm = raw_input("Manually enter VPN Realm: ")
+      WriteConfig(site=site, host=host, user=user, realm=realm)
+    else:
+      sys.exit()
+
+  if not options.password:
+    if options.cache:
+      password = '00000000'
+    else:
+      password = getpass.getpass()
+  else:
+    password = options.password  
+
+  if options.split:
+    try:
+      tunnel_routes = GetConfig(site, 'tunnel_routes')
+    except ConfigParser.NoOptionError:
+      Output('There are no tunnel routes configured for site \'%s\'' % (site), type='stderr', exit='yes')
+  else:
+    tunnel_routes = False
+
+  if options.curses:
+    display = 'curses'
+  else:
+    display = None
+
+  logger = StartLogging(site=site, host=host)
+
+  # Move into common function
+  if not os.path.exists(os.path.join(os.getenv('HOME'), '.juniper_networks', 'network_connect', 'ncui')):
+    ok = raw_input('ncui binary does not exist, would you like to compile now? (Y/N): ')
+    if ok in ('y', 'Y'):
+      logger.info('ncui binary does not exist, searching for shared object for compilation')
+      if not os.path.exists(os.path.join(os.getenv('HOME'), '.juniper_networks', 'network_connect', 'libncui.so')):
+        logger.info('libncui.so does not exist, please reinstall your VPN client from https://%s' % (host))
+        sys.exit()
+      util = utils.Utils(logger)
+      util.CompileNcui()
+    else:
+      sys.exit()
+      
+  vpn = Vpn(user=GetConfig(site, 'user'),
+            host=GetConfig(site, 'host'),
+            realm=GetConfig(site, 'realm'),
+            password=password,
+            logger=logger,
+            tunnel_routes=tunnel_routes,
+            site=site,
+            display=display)
+
+
+if __name__ == '__main__':
+  main()

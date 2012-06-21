@@ -1,0 +1,10 @@
+jvpn: Juniper Network Connect Wrapper for Linux
+===============================================
+
+Homepage: https://www.github.com/earies
+
+Requirements:
+* Python 2.6 <= version < 3.0
+
+To install
+$ sudo python setup.py install
