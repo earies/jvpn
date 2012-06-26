@@ -441,13 +441,15 @@ def main():
 
   logger = StartLogging(site=site, host=host)
 
-  # Move into common function
   if not os.path.exists(os.path.join(os.getenv('HOME'), '.juniper_networks', 'network_connect', 'ncui')):
     ok = raw_input('ncui binary does not exist, would you like to compile now? (Y/N): ')
     if ok in ('y', 'Y'):
       logger.info('ncui binary does not exist, searching for shared object for compilation')
       if not os.path.exists(os.path.join(os.getenv('HOME'), '.juniper_networks', 'network_connect', 'libncui.so')):
         logger.info('libncui.so does not exist, please reinstall your VPN client from https://%s' % (host))
+        sys.exit()
+      if not os.path.exists(os.path.join('/usr', 'lib', 'crt1.o')):
+        logger.info('32-bit compatible libraries are not installed (ia32-libs on deb-based systems), refer to your distro pkg mgr for installation')
         sys.exit()
       util = utils.Utils(logger)
       util.CompileNcui()

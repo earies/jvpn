@@ -17,6 +17,7 @@ class Display(object):
       if self.app.run() is False:
         ok = raw_input('Are you sure you want to disconnect? (Y/N): ')
         if ok in ('y', 'Y'):
+          self.logger.info('Sending SIGTERM to ncui process')
           os.killpg(self.pid, signal.SIGTERM)
           os.wait()
           try:

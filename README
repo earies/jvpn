@@ -5,7 +5,7 @@ Homepage: https://www.github.com/earies
 
 Requirements:
 * Python 2.6 <= version < 3.0
-* gcc 4.5+ (multilib)
+* gcc 4.5+ w/ 32-bit libraries installed (multilib - /usr/lib)
 * Juniper Network Connect Client for Linux (~/.juniper_networks/network_connect/)
 
 To install
